@@ -1,0 +1,6 @@
+numpy
+pandas
+evidently
+scikit-learn
+scipy
+nannyml

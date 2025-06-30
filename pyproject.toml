@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xadapt-drift"
+version = "0.0.1"
+description = "A simple drift detection package"
+authors = [{name="Alexandre Simões", email="alexandredesouzasimoes@gmail.com"}]
+readme = "README.md"
+license = {file = "MIT"}
+dependencies = [
+    "numpy",
+    "pandas",
+    "evidently",
+]
