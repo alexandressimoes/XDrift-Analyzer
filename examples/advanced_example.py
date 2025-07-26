@@ -26,8 +26,18 @@ from xadapt_drift.adapters.sklearn_adapter import SklearnAdapter
 plt.style.use('seaborn-whitegrid')
 sns.set_palette('viridis')
 
-def create_synthetic_data(n_samples=1000, n_cat_features=3, n_num_features=5):
-    """Create a synthetic dataset with mixed data types."""
+def create_synthetic_data(n_samples=10000, n_cat_features=3, n_num_features=5):
+    """Create a synthetic dataset with mixed data types.
+    Args:
+        n_samples: Total number of samples
+        n_cat_features: Number of categorical features
+        n_num_features: Number of numerical features
+    Returns:
+        DataFrame with mixed features and target variable
+        y.astype(int): Binary target variable
+        num_cols: List of numerical feature names
+        cat_cols: List of categorical feature names
+    """
     # Create numerical features
     X_num = np.random.randn(n_samples, n_num_features)
     
@@ -58,7 +68,17 @@ def create_synthetic_data(n_samples=1000, n_cat_features=3, n_num_features=5):
     return df, y.astype(int), num_cols, cat_cols
 
 def induce_drift(df, num_cols, cat_cols, drift_type='mean_shift'):
-    """Induce different types of drift in the data."""
+    """Induce different types of drift in the dataset.
+    Args:
+        df: Original DataFrame
+        num_cols: List of numerical feature names
+        cat_cols: List of categorical feature names
+        drift_type: Type of drift to induce ('mean_shift', 'variance_change', 'category_frequency', 'multiple')
+    Returns:
+        drifted_df: DataFrame with induced drift
+        drifted_features: List of features that were changed
+    """
+    
     drifted_df = df.copy()
     
     if drift_type == 'mean_shift':
