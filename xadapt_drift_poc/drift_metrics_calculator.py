@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 import json
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
 
 import shap
 
@@ -59,6 +59,9 @@ class DriftMetricsCalculator:
     - Integrar com SmartDriftAnalyzer para calcular apenas métricas aplicáveis
     """
 
+    # Constante global para evitar divisão por zero
+    EPSILON = 1e-10  # IEEE 754 double precision: ~2.22e-16
+
     def __init__(self, feature_names=None, default_bins='auto'):
         self.feature_names = feature_names
         self.default_bins = default_bins
@@ -74,6 +77,10 @@ class DriftMetricsCalculator:
             'js_divergence': self.jensen_shannon_divergence,
             'kl_divergence': self.kl_divergence
         }
+
+    def _apply_epsilon(self, probabilities: np.ndarray) -> np.ndarray:
+        """Método centralizado para aplicar epsilon"""
+        return np.where(probabilities == 0, self.EPSILON, probabilities)
     
     def calculate_doane_bins(self, data):
         """
@@ -305,6 +312,11 @@ class DriftMetricsCalculator:
             # Calcular distância de Wasserstein
             wasserstein_dist = wasserstein_distance(ref_vals, curr_vals)
             
+            # Calcular escala robusta (IQR) para normalização
+            ref_q75 = np.percentile(ref_vals, 75)
+            ref_q25 = np.percentile(ref_vals, 25)
+            reference_iqr = ref_q75 - ref_q25
+            
             # Normalizar pela amplitude dos dados para interpretação
             data_range = max(ref_vals.max(), curr_vals.max()) - min(ref_vals.min(), curr_vals.min())
             if data_range == 0:
@@ -312,10 +324,18 @@ class DriftMetricsCalculator:
                 
             normalized_distance = wasserstein_dist / data_range
             
+            # Normalização por IQR (mais robusta a outliers)
+            if reference_iqr > 1e-9:
+                normalized_by_iqr = wasserstein_dist / reference_iqr
+            else:
+                normalized_by_iqr = normalized_distance
+            
             return {
                 'wasserstein_distance': float(wasserstein_dist),
                 'normalized_distance': float(normalized_distance),
-                'data_range': float(data_range)
+                'normalized_by_iqr': float(normalized_by_iqr),
+                'data_range': float(data_range),
+                'reference_iqr': float(reference_iqr)
             }
             
         except Exception as e:
@@ -342,6 +362,9 @@ class DriftMetricsCalculator:
                 ref_prob = hist_data['ref_prob']
                 curr_prob = hist_data['curr_prob']
                 bins_used = hist_data['bins_used']
+
+            ref_prob = self._apply_epsilon(ref_prob)
+            curr_prob = self._apply_epsilon(curr_prob)
 
             hellinger_dist = np.sqrt(0.5 * np.sum((np.sqrt(ref_prob) - np.sqrt(curr_prob)) ** 2))
             
@@ -382,9 +405,19 @@ class DriftMetricsCalculator:
         except Exception as e:
             return {'tvd': np.nan, 'error': str(e)}
 
-    def psi(self, reference, current, column_type, bins=None):
+    def psi(self, 
+        reference, 
+        current, 
+        column_type: str, 
+        bins: Optional[int] = None
+    ) -> Dict[str, Any]:
         """
-        Implementa PSI (Population Stability Index) para dados numéricos e categóricos.
+        PSI usando método unificado de binning (_calculate_histogram_pair)
+        
+        Vantagens:
+        - Consistência com Hellinger, TVD, JS
+        - Bins calculados por Doane nos mesmos dados
+        - Edges alinhados entre ref e current
         """
         try:
             if column_type == 'categorical':
@@ -396,30 +429,32 @@ class DriftMetricsCalculator:
                 bins_used = len(ref_counts)
                 method = 'categorical_counts'
             
-            else: # numerical
-                ref_series = pd.Series(reference).dropna()
-                curr_series = pd.Series(current).dropna()
+            else:  # numerical - USAR _calculate_histogram_pair
                 if bins is None or bins == 'auto':
-                    bins = self.calculate_doane_bins(ref_series)
+                    bins = self.calculate_doane_bins(reference)
                 
-                ref_hist, bin_edges = np.histogram(ref_series, bins=bins)
-                curr_hist, _ = np.histogram(curr_series, bins=bin_edges)
-
-                ref_prop = ref_hist / len(ref_series) if len(ref_series) > 0 else np.zeros_like(ref_hist, dtype=float)
-                curr_prop = curr_hist / len(curr_series) if len(curr_series) > 0 else np.zeros_like(curr_hist, dtype=float)
-                bins_used = bins
-                method = 'doane_binning'
-
-            ref_prop = np.where(ref_prop == 0, 1e-7, ref_prop)
-            curr_prop = np.where(curr_prop == 0, 1e-7, curr_prop)
+                # UNIFICADO: usar método centralizado
+                hist_data = self._calculate_histogram_pair(
+                    reference, current, bins, method='doane'
+                )
+                
+                ref_prop = hist_data['ref_prob']
+                curr_prop = hist_data['curr_prob']
+                bins_used = hist_data['bins_used']
+                method = 'doane_unified'
             
+            ref_prop = self._apply_epsilon(ref_prop)
+            curr_prop = self._apply_epsilon(curr_prop)
+            
+            # Cálculo PSI padrão
             psi_value = np.sum((curr_prop - ref_prop) * np.log(curr_prop / ref_prop))
 
             return {
                 'psi_value': float(psi_value),
                 'regulatory_compliant': True,
                 'bins_used': bins_used,
-                'method': method
+                'method': method,
+                'binning_consistency': 'unified_with_other_metrics'  # NOVO
             }
         except Exception as e:
             return {'psi_value': np.nan, 'error': str(e)}
@@ -470,8 +505,8 @@ class DriftMetricsCalculator:
                 curr_prob = hist_data['curr_prob']
                 bins_used = hist_data['bins_used']
 
-            ref_prob = np.where(ref_prob == 0, 1e-10, ref_prob)
-            curr_prob = np.where(curr_prob == 0, 1e-10, curr_prob)
+            ref_prob = self._apply_epsilon(ref_prob)
+            curr_prob = self._apply_epsilon(curr_prob)
             
             js_div = jensenshannon(ref_prob, curr_prob) ** 2
             
@@ -502,8 +537,8 @@ class DriftMetricsCalculator:
                 curr_prob = hist_data['curr_prob']
                 bins_used = hist_data['bins_used']
 
-            ref_prob = np.where(ref_prob == 0, 1e-10, ref_prob)
-            curr_prob = np.where(curr_prob == 0, 1e-10, curr_prob)
+            ref_prob = self._apply_epsilon(ref_prob)
+            curr_prob = self._apply_epsilon(curr_prob)
             
             kl_div = np.sum(curr_prob * np.log(curr_prob / ref_prob))
             
@@ -603,7 +638,7 @@ class DriftMetricsCalculator:
             applicable_metrics = feature_info.get('applicable_metrics', [])
             column_type = feature_info.get('feature_type', 'unknown')
             
-            print(f"{feature_name} ({column_type}): {len(applicable_metrics)} métricas")
+            # print(f"{feature_name} ({column_type}): {len(applicable_metrics)} métricas")
             
             # Calcular métricas aplicáveis
             feature_results = self.calculate_metrics_for_feature(

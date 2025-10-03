@@ -187,6 +187,174 @@ class AdaptationStrategy(ABC):
 
 
 
+
+class CategoricalDriftType(Enum):
+    """Tipos de drift categórico"""
+    NO_DRIFT = "no_drift"
+    FREQUENCY_SHIFT = "frequency_shift"
+    NEW_CATEGORIES = "new_categories"
+    MISSING_CATEGORIES = "missing_categories"
+
+
+class NewCategoryHandlingStrategy:
+    """
+    Estratégia para lidar com novas categorias em features categóricas.
+    
+    CRITICIDADE: ALTA
+    
+    Ações baseadas em severidade:
+    - 1 categoria nova → Feature Engineering (map to OTHER)
+    - 2 categorias novas → Partial Retraining (encoder + última camada)
+    - 3+ categorias novas → Full Retraining
+    
+    Referências:
+    - Provost & Fawcett (2013) - Data Science for Business
+    - Quinonero-Candela et al. (2009) - Dataset Shift in ML
+    """
+    
+    name = "New Category Handling"
+    description = "Handles unseen categorical values in production data"
+    
+    def can_apply(self, drift_report: Dict[str, Any]) -> bool:
+        """
+        Verifica se há novas categorias detectadas no relatório
+        
+        Args:
+            drift_report: Relatório completo do DriftReportGenerator
+        
+        Returns:
+            bool: True se há novas categorias detectadas
+        """
+        summary = drift_report.get('executive_summary', {})
+        return summary.get('features_with_new_categories', 0) > 0
+    
+    def estimate_impact(self, drift_report: Dict[str, Any]) -> float:
+        """
+        Estima impacto baseado em número de features e categorias afetadas
+        
+        Returns:
+            float: Score de impacto [0, 1]
+        """
+        summary = drift_report.get('executive_summary', {})
+        n_features = summary.get('features_with_new_categories', 0)
+        total_cats = summary.get('categorical_drift_summary', {}).get('total_new_categories', 0)
+        
+        # Peso aumenta com número de features e categorias
+        if n_features >= 3 or total_cats >= 10:
+            return 1.0  # Máxima prioridade
+        elif n_features == 2 or total_cats >= 5:
+            return 0.85
+        elif n_features == 1 and total_cats >= 3:
+            return 0.7
+        else:
+            return 0.6
+    
+    def execute(self, drift_report: Dict[str, Any], model=None) -> Dict[str, Any]:
+        """
+        Executa estratégia de adaptação para novas categorias
+        
+        Args:
+            drift_report: Relatório completo
+            model: Modelo atual (opcional)
+        
+        Returns:
+            dict: Resultado da adaptação com ação, confiança e passos
+        """
+        summary = drift_report.get('executive_summary', {})
+        categorical_alerts = summary.get('critical_categorical_drift', [])
+        
+        # Filtrar apenas alertas de novas categorias
+        new_cat_alerts = [
+            alert for alert in categorical_alerts 
+            if alert.get('drift_type') == 'NEW_CATEGORIES'
+        ]
+        
+        if not new_cat_alerts:
+            return {
+                'action': 'NO_ACTION',
+                'confidence': 1.0,
+                'reasoning': 'No new categories detected'
+            }
+        
+        # Contar features e categorias
+        n_features = len(new_cat_alerts)
+        total_cats = sum(alert['n_new'] for alert in new_cat_alerts)
+        
+        # Lógica de decisão baseada em severidade
+        if n_features >= 3 or total_cats >= 10:
+            action = 'FULL_RETRAINING'
+            confidence = 0.95
+            reasoning = (
+                f"CRITICAL: {n_features} features com {total_cats} novas categorias. "
+                f"Full retraining necessário para garantir performance."
+            )
+            steps = [
+                "1. Coletar dados históricos incluindo novas categorias",
+                "2. Re-treinar modelo completo com encoding atualizado",
+                "3. Validar performance em holdout set",
+                "4. A/B test antes de deploy completo",
+                "5. Monitorar métricas por 7 dias após deploy"
+            ]
+        
+        elif n_features == 2 or (n_features == 1 and total_cats >= 5):
+            action = 'PARTIAL_RETRAINING'
+            confidence = 0.88
+            reasoning = (
+                f"HIGH: {n_features} features com {total_cats} novas categorias. "
+                f"Partial retraining do encoder e camadas finais."
+            )
+            steps = [
+                "1. Atualizar feature encoder para incluir novas categorias",
+                "2. Re-treinar apenas últimas 2 camadas do modelo",
+                "3. Validar em dados recentes (última semana)",
+                "4. Deploy gradual (10% → 50% → 100%)",
+                "5. Rollback automático se AUC cair >2%"
+            ]
+        
+        else:  # 1 feature, <5 categorias
+            action = 'FEATURE_ENGINEERING'
+            confidence = 0.75
+            reasoning = (
+                f"MEDIUM: {n_features} feature com {total_cats} novas categorias. "
+                f"Mapear para categoria 'OTHER' é suficiente."
+            )
+            steps = [
+                "1. Criar mapeamento: novas categorias → 'OTHER'",
+                "2. Aplicar mapeamento no preprocessing pipeline",
+                "3. Validar predições em sample de 1000 casos",
+                "4. Deploy com monitoramento intensivo",
+                "5. Considerar retraining se 'OTHER' > 10% dos dados"
+            ]
+        
+        return {
+            'strategy': self.name,
+            'action': action,
+            'confidence': confidence,
+            'estimated_improvement': 0.8 if action == 'FULL_RETRAINING' else 0.6,
+            'estimated_cost': 0.9 if action == 'FULL_RETRAINING' else (0.5 if action == 'PARTIAL_RETRAINING' else 0.2),
+            'reasoning': reasoning,
+            'implementation_steps': steps,
+            'affected_features': [alert['feature'] for alert in new_cat_alerts],
+            'new_category_details': {
+                alert['feature']: {
+                    'new_categories': alert['new_categories'],
+                    'n_new': alert['n_new'],
+                    'severity': alert['severity']
+                }
+                for alert in new_cat_alerts
+            },
+            'priority': 'CRITICAL' if action == 'FULL_RETRAINING' else 'HIGH',
+            'auto_execute': action == 'FULL_RETRAINING',  # Auto-executar se crítico
+            'rollback_plan': [
+                'Keep previous model version active',
+                'Route traffic to old model if new model fails',
+                'Log all prediction errors for analysis',
+                'Alert on-call team if error rate > 1%'
+            ]
+        }
+
+
+
 class ContinuousMonitoringStrategy(AdaptationStrategy):
     """Estratégia de monitoramento contínuo sem intervenção."""
     

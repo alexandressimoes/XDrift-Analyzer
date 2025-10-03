@@ -7,7 +7,8 @@ from pathlib import Path
 import time
 import json
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
+from statsmodels.stats.multitest import multipletests
 
 import shap
 
@@ -277,27 +278,37 @@ class DriftReportGenerator:
             p_value = metric_result.get('p_value', 1.0)
             interpretation['raw_value'] = {'statistic': ks_stat, 'p_value': p_value}
             
-            if p_value < self.thresholds['ks_test']['alpha_strict']:
-                interpretation['severity'] = 'HIGH'
-                interpretation['confidence'] = 'VERY_HIGH'
-                interpretation['scientific_interpretation'] = f'KS-test: p={p_value:.4f} < 0.01, altamente significativo'
-                interpretation['business_recommendation'] = 'Forte evidência de mudança distribucional'
-            elif p_value < self.thresholds['ks_test']['alpha_standard']:
-                interpretation['severity'] = 'MEDIUM'
-                interpretation['confidence'] = 'HIGH'
-                interpretation['scientific_interpretation'] = f'KS-test: p={p_value:.4f} < 0.05, estatisticamente significativo'
-                interpretation['business_recommendation'] = 'Evidência de mudança distribucional'
-            elif p_value < self.thresholds['ks_test']['alpha_liberal']:
+            # CORREÇÃO: Avaliar MAGNITUDE do efeito (D) além de significância (p-value)
+            # Referência: Cohen (1988), Sawilowsky (2009) - Effect Size Guidelines
+            
+            if p_value >= self.thresholds['ks_test']['alpha_standard']:  # p >= 0.05
                 interpretation['severity'] = 'LOW'
-                interpretation['confidence'] = 'MODERATE'
-                interpretation['scientific_interpretation'] = f'KS-test: p={p_value:.4f} < 0.10, marginalmente significativo'
-                interpretation['business_recommendation'] = 'Investigar possível mudança'
-                interpretation['uncertainty_notes'] = 'Significância marginal - requer validação adicional'
-            else:
-                interpretation['severity'] = 'NEGLIGIBLE'
                 interpretation['confidence'] = 'HIGH'
-                interpretation['scientific_interpretation'] = f'KS-test: p={p_value:.4f} ≥ 0.10, não significativo'
+                interpretation['scientific_interpretation'] = f'KS-test: p={p_value:.4f} ≥ 0.05, não significativo'
                 interpretation['business_recommendation'] = 'Nenhuma ação necessária'
+            else:
+                # Significativo estatisticamente - avaliar magnitude do efeito
+                if ks_stat < 0.05:  # Efeito trivial
+                    interpretation['severity'] = 'LOW'
+                    interpretation['confidence'] = 'MODERATE'
+                    interpretation['scientific_interpretation'] = f'KS-test: p={p_value:.4f} significativo, mas D={ks_stat:.3f} < 0.05 (efeito trivial)'
+                    interpretation['business_recommendation'] = 'Significância estatística sem relevância prática'
+                    interpretation['uncertainty_notes'] = 'Alta potência estatística detectou mudança mínima (Cohen 1988)'
+                elif ks_stat < 0.10:  # Efeito pequeno
+                    interpretation['severity'] = 'MEDIUM'
+                    interpretation['confidence'] = 'HIGH'
+                    interpretation['scientific_interpretation'] = f'KS-test: D={ks_stat:.3f} (pequeno), p={p_value:.4f}'
+                    interpretation['business_recommendation'] = 'Mudança pequena mas detectável - monitorar tendência'
+                elif ks_stat < 0.20:  # Efeito moderado
+                    interpretation['severity'] = 'HIGH'
+                    interpretation['confidence'] = 'VERY_HIGH'
+                    interpretation['scientific_interpretation'] = f'KS-test: D={ks_stat:.3f} (moderado), p={p_value:.4f}'
+                    interpretation['business_recommendation'] = 'Mudança moderada - investigar causas'
+                else:  # Efeito grande (D >= 0.20)
+                    interpretation['severity'] = 'CRITICAL'
+                    interpretation['confidence'] = 'VERY_HIGH'
+                    interpretation['scientific_interpretation'] = f'KS-test: D={ks_stat:.3f} (grande), p={p_value:.2e}'
+                    interpretation['business_recommendation'] = 'Mudança substancial - ação imediata necessária'
         
         # Chi-squared Test
         elif metric_name == 'chi_square' and 'chi2_statistic' in metric_result:
@@ -331,27 +342,65 @@ class DriftReportGenerator:
             distance = metric_result['wasserstein_distance']
             interpretation['raw_value'] = distance
             
-            if distance < self.thresholds['wasserstein']['low']:
-                interpretation['severity'] = 'LOW'
-                interpretation['confidence'] = 'HIGH'
-                interpretation['scientific_interpretation'] = f'Wasserstein={distance:.3f} < 0.1: Distribuições similares'
-                interpretation['business_recommendation'] = 'Diferença mínima detectada'
-            elif distance < self.thresholds['wasserstein']['moderate']:
-                interpretation['severity'] = 'MEDIUM'
-                interpretation['confidence'] = 'HIGH'
-                interpretation['scientific_interpretation'] = f'Wasserstein={distance:.3f}: Diferença moderada'
-                interpretation['business_recommendation'] = 'Monitorar tendência'
+            # CORREÇÃO: Usar normalização por IQR (mais robusta) quando disponível
+            # Referência: Villani (2008) - Optimal Transport Theory
+            if 'normalized_by_iqr' in metric_result:
+                normalized_dist = metric_result['normalized_by_iqr']
+                ref_iqr = metric_result.get('reference_iqr', 1.0)
+                
+                # Thresholds sobre % do IQR
+                if normalized_dist < 0.05:  # < 5% do IQR
+                    interpretation['severity'] = 'LOW'
+                    interpretation['confidence'] = 'HIGH'
+                    interpretation['scientific_interpretation'] = f'Wasserstein={distance:.3f} (~{normalized_dist*100:.1f}% IQR): Diferença mínima'
+                    interpretation['business_recommendation'] = 'Variação dentro do esperado'
+                elif normalized_dist < 0.15:  # < 15% do IQR
+                    interpretation['severity'] = 'MEDIUM'
+                    interpretation['confidence'] = 'HIGH'
+                    interpretation['scientific_interpretation'] = f'Wasserstein={distance:.3f} (~{normalized_dist*100:.1f}% IQR): Diferença moderada'
+                    interpretation['business_recommendation'] = 'Monitorar tendência'
+                elif normalized_dist < 0.30:  # < 30% do IQR
+                    interpretation['severity'] = 'HIGH'
+                    interpretation['confidence'] = 'HIGH'
+                    interpretation['scientific_interpretation'] = f'Wasserstein={distance:.3f} (~{normalized_dist*100:.1f}% IQR): Diferença substancial'
+                    interpretation['business_recommendation'] = 'Investigar causas da mudança'
+                else:  # >= 30% do IQR
+                    interpretation['severity'] = 'CRITICAL'
+                    interpretation['confidence'] = 'HIGH'
+                    interpretation['scientific_interpretation'] = f'Wasserstein={distance:.3f} (~{normalized_dist*100:.1f}% IQR): Grande mudança distribucional'
+                    interpretation['business_recommendation'] = 'Ação corretiva imediata'
+                
+                interpretation['uncertainty_notes'] = f'Distância normalizada por IQR={ref_iqr:.3f} (Earth Mover Distance - Villani 2008)'
             else:
-                interpretation['severity'] = 'HIGH'
-                interpretation['confidence'] = 'HIGH'
-                interpretation['scientific_interpretation'] = f'Wasserstein={distance:.3f} ≥ 0.5: Grande diferença distribucional'
-                interpretation['business_recommendation'] = 'Investigar causas da mudança'
+                # Fallback: usar thresholds absolutos (menos robusto)
+                if distance < self.thresholds['wasserstein']['low']:
+                    interpretation['severity'] = 'LOW'
+                    interpretation['confidence'] = 'HIGH'
+                    interpretation['scientific_interpretation'] = f'Wasserstein={distance:.3f} < 0.1: Distribuições similares'
+                    interpretation['business_recommendation'] = 'Diferença mínima detectada'
+                elif distance < self.thresholds['wasserstein']['moderate']:
+                    interpretation['severity'] = 'MEDIUM'
+                    interpretation['confidence'] = 'HIGH'
+                    interpretation['scientific_interpretation'] = f'Wasserstein={distance:.3f} < 0.3: Diferença moderada'
+                    interpretation['business_recommendation'] = 'Monitorar tendência'
+                elif distance < self.thresholds['wasserstein']['high']:  # BUG FIX: adicionar elif faltante
+                    interpretation['severity'] = 'HIGH'
+                    interpretation['confidence'] = 'HIGH'
+                    interpretation['scientific_interpretation'] = f'Wasserstein={distance:.3f} < 0.5: Diferença substancial'
+                    interpretation['business_recommendation'] = 'Investigar causas'
+                else:  # >= 0.5
+                    interpretation['severity'] = 'CRITICAL'
+                    interpretation['confidence'] = 'HIGH'
+                    interpretation['scientific_interpretation'] = f'Wasserstein={distance:.3f} ≥ 0.5: Grande diferença distribucional'
+                    interpretation['business_recommendation'] = 'Ação imediata'
+                
+                interpretation['uncertainty_notes'] = 'Usando thresholds absolutos (recomendado: normalizar por escala da feature)'
             
             # Contexto para diferentes tipos de dados
             if feature_type == 'numerical':
-                interpretation['uncertainty_notes'] = 'Earth Mover Distance - especialmente adequada para dados contínuos'
+                interpretation['uncertainty_notes'] += ' | Earth Mover Distance - adequada para dados contínuos'
             elif feature_type == 'categorical_numeric':
-                interpretation['uncertainty_notes'] = 'Pode capturar ordem em dados categóricos ordinais'
+                interpretation['uncertainty_notes'] += ' | Pode capturar ordem em dados categóricos ordinais'
         
         # Hellinger Distance
         elif metric_name == 'hellinger_distance' and 'hellinger_distance' in metric_result:
@@ -426,6 +475,187 @@ class DriftReportGenerator:
             interpretation['uncertainty_notes'] = f'Métrica {metric_name} não reconhecida ou dados insuficientes'
         
         return interpretation
+    
+    def apply_multiple_testing_correction(
+        self, 
+        p_values_dict: Dict[str, float], 
+        method: str = 'fdr_bh',
+        alpha: float = 0.05
+    ) -> Dict[str, Any]:
+        """
+        Aplica correção de múltiplos testes (Benjamini-Hochberg FDR)
+        
+        Args:
+            p_values_dict: {feature_name: p_value}
+            method: 'bonferroni', 'fdr_bh', 'holm'
+            alpha: Nível de significância (default: 0.05)
+        
+        Returns:
+            dict com p-values corrigidos e estatísticas
+        
+        Referência:
+            Benjamini & Hochberg (1995) - Controlling the False Discovery Rate
+        """
+        if not p_values_dict:
+            return {'error': 'No p-values provided'}
+        
+        features = list(p_values_dict.keys())
+        p_values = np.array([p_values_dict[f] for f in features])
+        
+        # Remover NaN/inf
+        valid_mask = np.isfinite(p_values)
+        if not valid_mask.any():
+            return {'error': 'All p-values are NaN or inf'}
+        
+        features_valid = [f for i, f in enumerate(features) if valid_mask[i]]
+        p_values_valid = p_values[valid_mask]
+        
+        # Aplicar correção
+        reject, p_corrected, alphacSidak, alphacBonf = multipletests(
+            p_values_valid, 
+            alpha=alpha, 
+            method=method
+        )
+        
+        # Criar resultado
+        corrected_dict = {}
+        for i, feature in enumerate(features_valid):
+            corrected_dict[feature] = {
+                'p_value_raw': float(p_values_valid[i]),
+                'p_value_corrected': float(p_corrected[i]),
+                'reject_h0': bool(reject[i]),
+                'significant': bool(p_corrected[i] < alpha)
+            }
+        
+        # Estatísticas gerais
+        n_significant_raw = int(np.sum(p_values_valid < alpha))
+        n_significant_corrected = int(np.sum(reject))
+        
+        return {
+            'corrected_p_values': corrected_dict,
+            'method': method,
+            'alpha': alpha,
+            'n_features_tested': len(features_valid),
+            'n_significant_raw': n_significant_raw,
+            'n_significant_corrected': n_significant_corrected,
+            'false_discovery_rate': alpha,  # Para FDR-BH
+            'interpretation': self._interpret_correction_results(
+                n_significant_raw, n_significant_corrected, method
+            )
+        }
+    
+    def _interpret_correction_results(
+        self, 
+        n_raw: int, 
+        n_corrected: int, 
+        method: str
+    ) -> str:
+        """Gera interpretação textual dos resultados da correção"""
+        if n_raw == n_corrected:
+            return f"Todos os {n_raw} resultados significativos se mantiveram após correção {method}"
+        elif n_corrected == 0:
+            return f"Nenhum resultado sobreviveu à correção {method} (possíveis falsos positivos)"
+        else:
+            n_lost = n_raw - n_corrected
+            pct_lost = (n_lost / n_raw * 100) if n_raw > 0 else 0
+            return (f"Correção {method} eliminou {n_lost} resultados ({pct_lost:.1f}% dos "
+                   f"significativos), mantendo {n_corrected} com evidência robusta")
+    
+    def _extract_p_values_from_metrics(self, drift_metrics_results: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Extrai p-values de testes estatísticos das métricas calculadas
+        
+        Args:
+            drift_metrics_results: Resultados do DriftMetricsCalculator
+        
+        Returns:
+            Dict mapping 'feature_metric' → p_value
+        """
+        p_values = {}
+        
+        for feature_name, results in drift_metrics_results.items():
+            if feature_name.startswith('_'):  # Skip metadata
+                continue
+            
+            if 'error' in results:
+                continue
+            
+            # Extrair p-values de testes que os possuem
+            # KS Test
+            if 'ks_test' in results and isinstance(results['ks_test'], dict):
+                p_val = results['ks_test'].get('p_value')
+                if p_val is not None and not np.isnan(p_val):
+                    p_values[f"{feature_name}_ks_test"] = float(p_val)
+            
+            # Chi-squared Test
+            if 'chi_square' in results and isinstance(results['chi_square'], dict):
+                p_val = results['chi_square'].get('p_value')
+                if p_val is not None and not np.isnan(p_val):
+                    p_values[f"{feature_name}_chi_square"] = float(p_val)
+        
+        return p_values
+    
+    def _update_interpretations_with_correction(
+        self, 
+        interpreted_metrics: Dict[str, Any], 
+        correction_results: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Atualiza interpretações com resultados da correção de múltiplos testes
+        
+        Args:
+            interpreted_metrics: Métricas interpretadas originais
+            correction_results: Resultados do apply_multiple_testing_correction
+        
+        Returns:
+            Métricas interpretadas atualizadas
+        """
+        if not correction_results or 'corrected_p_values' not in correction_results:
+            return interpreted_metrics
+        
+        corrected_p_values = correction_results['corrected_p_values']
+        
+        for key, correction_data in corrected_p_values.items():
+            # Parse: 'feature_name_metric' → feature_name, metric
+            parts = key.rsplit('_', 1)
+            if len(parts) != 2:
+                parts = key.rsplit('_', 2)  # Try 'feature_chi_square'
+            
+            if len(parts) >= 2:
+                metric = parts[-1]
+                feature_name = '_'.join(parts[:-1])
+            else:
+                continue
+            
+            if feature_name not in interpreted_metrics:
+                continue
+            
+            if 'metric_interpretations' not in interpreted_metrics[feature_name]:
+                continue
+            
+            if metric not in interpreted_metrics[feature_name]['metric_interpretations']:
+                continue
+            
+            # Adicionar informações de correção
+            interp = interpreted_metrics[feature_name]['metric_interpretations'][metric]
+            interp['multiple_testing'] = {
+                'p_value_raw': correction_data['p_value_raw'],
+                'p_value_corrected': correction_data['p_value_corrected'],
+                'significant_after_correction': correction_data['significant'],
+                'correction_method': correction_results['method']
+            }
+            
+            # Atualizar severidade se perdeu significância
+            if not correction_data['significant'] and interp.get('severity') in ['HIGH', 'CRITICAL']:
+                interp['severity_before_correction'] = interp['severity']
+                interp['severity'] = 'LOW'
+                interp['confidence'] = 'LOW'
+                interp['uncertainty_notes'] = (
+                    f"{interp.get('uncertainty_notes', '')} | "
+                    f"⚠️ Perdeu significância após correção FDR (possível falso positivo)"
+                ).strip(' | ')
+        
+        return interpreted_metrics
     
     def calculate_model_impact_analysis(
         self, 
@@ -574,7 +804,20 @@ class DriftReportGenerator:
         print(" 2. Interpretando métricas de drift com base científica...")
         interpreted_metrics = self.integrate_drift_metrics(drift_metrics_results)
         
-        # 3. Análise de impacto no modelo (se solicitado)
+        # 3. Correção de múltiplos testes (Benjamini-Hochberg FDR)
+        print(" 3. Aplicando correção de múltiplos testes (Benjamini-Hochberg)...")
+        p_values_dict = self._extract_p_values_from_metrics(drift_metrics_results)
+        multiple_testing_correction = None
+        if p_values_dict:
+            multiple_testing_correction = self.apply_multiple_testing_correction(
+                p_values_dict, method='fdr_bh', alpha=0.05
+            )
+            # Atualizar interpretações com p-values corrigidos
+            interpreted_metrics = self._update_interpretations_with_correction(
+                interpreted_metrics, multiple_testing_correction
+            )
+        
+        # 4. Análise de impacto no modelo (se solicitado)
         model_impact = None
         if include_model_impact:
         
@@ -582,14 +825,18 @@ class DriftReportGenerator:
                 reference_df, current_df, target_column
             )
         
-        # 4. Compilar relatório final
+        # 5. Compilar relatório final
         report['dataset_statistics'] = integrated_stats
         report['drift_analysis'] = interpreted_metrics
+        if multiple_testing_correction:
+            report['multiple_testing_correction'] = multiple_testing_correction
         if model_impact:
             report['model_impact_analysis'] = model_impact
         
-        # 5. Gerar resumo executivo
-        executive_summary = self._generate_executive_summary(integrated_stats, interpreted_metrics)
+        # 6. Gerar resumo executivo
+        executive_summary = self._generate_executive_summary(
+            integrated_stats, interpreted_metrics, multiple_testing_correction
+        )
         report['executive_summary'] = executive_summary
         
         print("✅ Relatório completo gerado!")
@@ -597,44 +844,86 @@ class DriftReportGenerator:
         
         return report
     
-    def _generate_executive_summary(self, integrated_stats, interpreted_metrics):
+    def _generate_executive_summary(self, integrated_stats, interpreted_metrics, multiple_testing_correction=None):
         """
         Gera resumo executivo baseado em evidências
         """
         summary = {
             'total_features_analyzed': len(interpreted_metrics),
             'features_with_significant_drift': 0,
+            'features_with_significant_drift_corrected': 0,  # NOVO: Após correção FDR
             'high_confidence_findings': 0,
             'requires_investigation': 0,
             'primary_concerns': [],
+            'false_positive_warnings': [],
+            'features_with_new_categories': 0,
+            'features_with_missing_categories': 0,
+            'critical_categorical_drift': [],
+            'categorical_drift_summary': {
+                'total_new_categories': 0,
+                'total_missing_categories': 0,
+                'severity': 'NONE'
+            }
         }
-        
+
         for feature_name, metrics in interpreted_metrics.items():
             if 'metric_interpretations' not in metrics:
                 continue
             
             feature_drift_detected = False
+            feature_drift_after_correction = False
             high_confidence_metrics = 0
             
             for metric_name, interpretation in metrics['metric_interpretations'].items():
+                # Verificar se tem correção de múltiplos testes
+                has_correction = 'multiple_testing' in interpretation
+                is_significant_corrected = (
+                    interpretation['multiple_testing']['significant_after_correction'] 
+                    if has_correction else True
+                )
+                
                 if interpretation['severity'] in ['HIGH', 'CRITICAL']:
                     feature_drift_detected = True
+                    
+                    # Contar apenas se passou pela correção (se aplicável)
+                    if is_significant_corrected:
+                        feature_drift_after_correction = True
                     
                     if interpretation['confidence'] in ['HIGH', 'VERY_HIGH']:
                         high_confidence_metrics += 1
                         
-                        # Adicionar às preocupações primárias
-                        summary['primary_concerns'].append({
+                        # Adicionar às preocupações primárias (apenas se significativo após correção)
+                        if is_significant_corrected:
+                            concern = {
+                                'feature': feature_name,
+                                'metric': metric_name,
+                                'severity': interpretation['severity'],
+                                'confidence': interpretation['confidence'],
+                                'interpretation': interpretation['scientific_interpretation'],
+                                'recommendation': interpretation['business_recommendation']
+                            }
+                            if has_correction:
+                                concern['corrected_p_value'] = interpretation['multiple_testing']['p_value_corrected']
+                            summary['primary_concerns'].append(concern)
+                
+                # Detectar possíveis falsos positivos
+                if has_correction and not is_significant_corrected:
+                    if interpretation.get('severity_before_correction') in ['HIGH', 'CRITICAL']:
+                        summary['false_positive_warnings'].append({
                             'feature': feature_name,
                             'metric': metric_name,
-                            'severity': interpretation['severity'],
-                            'confidence': interpretation['confidence'],
-                            'interpretation': interpretation['scientific_interpretation'],
-                            'recommendation': interpretation['business_recommendation']
+                            'severity_before': interpretation['severity_before_correction'],
+                            'p_value_raw': interpretation['multiple_testing']['p_value_raw'],
+                            'p_value_corrected': interpretation['multiple_testing']['p_value_corrected'],
+                            'message': 'Perdeu significância após correção FDR (provável falso positivo)'
                         })
             
+        
             if feature_drift_detected:
                 summary['features_with_significant_drift'] += 1
+            
+            if feature_drift_after_correction:
+                summary['features_with_significant_drift_corrected'] += 1
                 
             if high_confidence_metrics > 0:
                 summary['high_confidence_findings'] += 1
@@ -644,6 +933,95 @@ class DriftReportGenerator:
                                  if interp['severity'] == 'MEDIUM')
             if moderate_metrics >= 2:
                 summary['requires_investigation'] += 1
+            
+            if feature_name in integrated_stats:
+                feature_stats = integrated_stats[feature_name]
+                comparison = feature_stats.get('comparison_analysis')
+                
+                if comparison and 'categorical_changes' in comparison:
+                    cat_changes = comparison['categorical_changes']
+                    
+                    # Verificar novas categorias
+                    if cat_changes.get('new_categories'):
+                        new_cats = cat_changes['new_categories']
+                        n_new = len(new_cats)
+                        
+                        summary['features_with_new_categories'] += 1
+                        summary['categorical_drift_summary']['total_new_categories'] += n_new
+                        
+                        # Determinar severidade baseada em quantidade
+                        if n_new >= 5:
+                            severity = 'CRITICAL'
+                            risk_level = 'IMMEDIATE ACTION REQUIRED'
+                        elif n_new >= 3:
+                            severity = 'HIGH'
+                            risk_level = 'High risk of model failure'
+                        elif n_new >= 2:
+                            severity = 'MEDIUM'
+                            risk_level = 'Moderate risk - requires investigation'
+                        else:
+                            severity = 'LOW'
+                            risk_level = 'Low risk - monitor closely'
+                        
+                        summary['critical_categorical_drift'].append({
+                            'feature': feature_name,
+                            'drift_type': 'NEW_CATEGORIES',
+                            'new_categories': new_cats,
+                            'n_new': n_new,
+                            'severity': severity,
+                            'risk': f'Model may fail with unseen category values: {new_cats[:3]}{"..." if n_new > 3 else ""}',
+                            'risk_level': risk_level,
+                            'action_required': 'IMMEDIATE' if severity == 'CRITICAL' else 'HIGH_PRIORITY',
+                            'recommended_actions': [
+                                'Update feature encoding to handle new categories',
+                                'Retrain model with new category representation' if n_new >= 3 else 'Map new categories to "OTHER" bucket',
+                                'Validate model performance on new data',
+                                'Monitor prediction quality for affected feature'
+                            ]
+                        })
+                    
+                    # Verificar categorias perdidas (menos crítico mas importante)
+                    if cat_changes.get('missing_categories'):
+                        missing_cats = cat_changes['missing_categories']
+                        n_missing = len(missing_cats)
+                        
+                        summary['features_with_missing_categories'] += 1
+                        summary['categorical_drift_summary']['total_missing_categories'] += n_missing
+                        
+                        summary['critical_categorical_drift'].append({
+                            'feature': feature_name,
+                            'drift_type': 'MISSING_CATEGORIES',
+                            'missing_categories': missing_cats,
+                            'n_missing': n_missing,
+                            'severity': 'MEDIUM' if n_missing >= 3 else 'LOW',
+                            'risk': f'Data distribution shifted - {n_missing} categories disappeared',
+                            'risk_level': 'Data quality concern',
+                            'action_required': 'INVESTIGATION',
+                            'recommended_actions': [
+                                'Investigate why categories disappeared',
+                                'Check data collection pipeline',
+                                'Verify if change is expected (business logic)',
+                                'Consider retraining if distribution changed significantly'
+                            ]
+                        })
+        
+        #Determinar severidade globas de drift categorico
+        if summary['critical_categorical_drift']:
+            max_severity = max(
+                alert['severity'] 
+                for alert in summary['critical_categorical_drift']
+            )
+            summary['categorical_drift_summary']['severity'] = max_severity
+        
+        # Adicionar estatísticas da correção se disponível
+        if multiple_testing_correction:
+            summary['multiple_testing_stats'] = {
+                'method': multiple_testing_correction['method'],
+                'n_tests': multiple_testing_correction['n_features_tested'],
+                'n_significant_before': multiple_testing_correction['n_significant_raw'],
+                'n_significant_after': multiple_testing_correction['n_significant_corrected'],
+                'interpretation': multiple_testing_correction['interpretation']
+            }
         
         return summary
     
@@ -660,28 +1038,100 @@ class DriftReportGenerator:
         else:
             # Executive Summary
             summary = report['executive_summary']
+
+            if summary.get('critical_categorical_drift'):
+                print("ALERTAS CRÍTICOS: DRIFT CATEGÓRICO DETECTADO")
+                
+                cat_summary = summary['categorical_drift_summary']
+                print(f"\nRESUMO:")
+                print(f"   • Features com NOVAS categorias: {summary['features_with_new_categories']}")
+                print(f"   • Features com categorias PERDIDAS: {summary['features_with_missing_categories']}")
+                print(f"   • Total de novas categorias: {cat_summary['total_new_categories']}")
+                print(f"   • Total de categorias perdidas: {cat_summary['total_missing_categories']}")
+                print(f"   • Severidade global: {cat_summary['severity']}")
+                
+                print(f"\n  🔍 DETALHES POR FEATURE:")
+                for alert in summary['critical_categorical_drift']:
+                    icon = '❌' if alert['severity'] in ['CRITICAL', 'HIGH'] else '⚠️'
+                    print(f"\n   {icon} {alert['feature']} ({alert['drift_type']}):")
+                    print(f"      • Severidade: {alert['severity']}")
+                    print(f"      • Risco: {alert['risk']}")
+                    print(f"      • Nível de Risco: {alert['risk_level']}")
+                    print(f"      • Ação Requerida: {alert['action_required']}")
+                    
+                    if alert['drift_type'] == 'NEW_CATEGORIES':
+                        print(f"      • Novas categorias ({alert['n_new']}): {', '.join(map(str, alert['new_categories'][:5]))}")
+                        if alert['n_new'] > 5:
+                            print(f"        ... e mais {alert['n_new'] - 5} categorias")
+                    elif alert['drift_type'] == 'MISSING_CATEGORIES':
+                        print(f"      • Categorias perdidas ({alert['n_missing']}): {', '.join(map(str, alert['missing_categories'][:5]))}")
+                        if alert['n_missing'] > 5:
+                            print(f"        ... e mais {alert['n_missing'] - 5} categorias")
+                    
+                    print(f"      • Ações Recomendadas:")
+                    for i, action in enumerate(alert['recommended_actions'], 1):
+                        print(f"        {i}. {action}")
+                
+                print("\n" + "=" * 80)
+            
+
             print(f"\n  RESUMO EXECUTIVO:")
             print(f"   • Features analisadas: {summary['total_features_analyzed']}")
-            print(f"   • Features com drift significativo: {summary['features_with_significant_drift']}")
+            print(f"   • Features com drift significativo (raw): {summary['features_with_significant_drift']}")
+            
+            # Mostrar correção se disponível
+            if 'multiple_testing_stats' in summary:
+                mt_stats = summary['multiple_testing_stats']
+                print(f"   • Features com drift (após {mt_stats['method'].upper()}): {summary['features_with_significant_drift_corrected']}")
+                print(f"   • Testes realizados: {mt_stats['n_tests']}")
+                print(f"   • Significativos antes: {mt_stats['n_significant_before']}")
+                print(f"   • Significativos depois: {mt_stats['n_significant_after']}")
+            
             print(f"   • Achados de alta confiança: {summary['high_confidence_findings']}")
             print(f"   • Requerem investigação: {summary['requires_investigation']}")
             
+            if summary.get('features_with_new_categories', 0) > 0:
+                print(f"\n  ⚠️  DRIFT CATEGÓRICO:")
+                print(f"   • Features com novas categorias: {summary['features_with_new_categories']} 🔴")
+                print(f"   • Features com categorias perdidas: {summary['features_with_missing_categories']}")
+            
+            
+            # Avisos de Falsos Positivos
+            if summary.get('false_positive_warnings'):
+                print(f"\n  ⚠️ AVISOS DE POSSÍVEIS FALSOS POSITIVOS:")
+                for warning in summary['false_positive_warnings'][:3]:  # Top 3
+                    print(f"   • {warning['feature']} ({warning['metric']})")
+                    print(f"     - Severidade original: {warning['severity_before']}")
+                    print(f"     - p-value raw: {warning['p_value_raw']:.4f}")
+                    print(f"     - p-value corrigido: {warning['p_value_corrected']:.4f}")
+                    print(f"     - {warning['message']}")
+            
             # Primary Concerns
             if summary['primary_concerns']:
-                print(f"\n PREOCUPAÇÕES PRIMÁRIAS (ALTA CONFIANÇA):")
+                print(f"\n  PREOCUPAÇÕES PRIMÁRIAS (ALTA CONFIANÇA):")
                 for concern in summary['primary_concerns'][:5]:  # Top 5
                     print(f"      {concern['feature']} ({concern['metric']}):")
                     print(f"      • Severidade: {concern['severity']}")
                     print(f"      • Confiança: {concern['confidence']}")
+                    if 'corrected_p_value' in concern:
+                        print(f"      • p-value corrigido: {concern['corrected_p_value']:.4f}")
                     print(f"      • Interpretação: {concern['interpretation']}")
                     print(f"      • Recomendação: {concern['recommendation']}")
                     print()
             
+            # Estatísticas de Correção Múltipla
+            if 'multiple_testing_correction' in report:
+                mt_corr = report['multiple_testing_correction']
+                print(f"\n  📊 CORREÇÃO DE MÚLTIPLOS TESTES:")
+                print(f"   • Método: {mt_corr['method'].upper()} (Benjamini-Hochberg)")
+                print(f"   • {mt_corr['interpretation']}")
+                print(f"   • FDR (False Discovery Rate): {mt_corr['false_discovery_rate']:.2f}")
             
             # Scientific References
-            print(f"\n REFERÊNCIAS CIENTÍFICAS:")
+            print(f"\n  REFERÊNCIAS CIENTÍFICAS:")
             for ref in report['scientific_references']:
                 print(f"   • {ref}")
+            print(f"   • Multiple Testing: Benjamini & Hochberg (1995)")
             
             # Model Impact (if available)
             if 'model_impact_analysis' in report:

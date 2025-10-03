@@ -325,7 +325,7 @@ class DatasetAnalyzer:
         
         # Remover coluna target se especificada
         analysis_columns = [col for col in reference_df.columns if col not in target_column]
-        print(f"📊 Analisando {len(analysis_columns)} features (excluindo targets: {target_column})")
+        # print(f"📊 Analisando {len(analysis_columns)} features (excluindo targets: {target_column})")
         
         # Detectar tipos das features
         reference_feature_types = self.detect_column_types(reference_df[analysis_columns])
@@ -340,7 +340,7 @@ class DatasetAnalyzer:
             feature_type = reference_feature_types[column]
             type_counts[feature_type] += 1
             
-            print(f"   • {column}: {feature_type}")
+            # print(f"   • {column}: {feature_type}")
             
             # Estatísticas básicas universais
             basic_stats = {
@@ -414,9 +414,9 @@ class DatasetAnalyzer:
                     ref_categories = set(ref_data.unique())
                     curr_categories = set(curr_data.unique())
 
-                    print("DATASET ANALYSIS")
-                    print(f"Reference Categories: {ref_categories}")
-                    print(f"Current Categories: {curr_categories}")
+                    # print("DATASET ANALYSIS")
+                    # print(f"Reference Categories: {ref_categories}")
+                    # print(f"Current Categories: {curr_categories}")
 
                     comparison_analysis['categorical_changes'] = {
                         'new_categories': list(curr_categories - ref_categories),
